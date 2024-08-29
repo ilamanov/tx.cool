@@ -1,87 +1,58 @@
-import { createClient } from '@supabase/supabase-js';
 import type { Address } from 'viem';
 
-import type {
-  SupabaseChatLastUpdated,
-  SupabaseChatMessageTx,
-  TransposeOnChainMessagesResponse,
-} from '@/lib/types/api';
 import type { ChatMessageTx } from '@/lib/types/chat';
 
 const fetchRecentMessages = async (address: Address, page: number): Promise<ChatMessageTx[]> => {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_KEY,
-  );
-
-  // First, select address message data from Supabase.
-  const { data: addressData } = await supabase
-    .from('chat_last_updated')
-    .select('lastUpdated')
-    .eq('address', address.toLowerCase())
-    .returns<SupabaseChatLastUpdated[]>();
-
-  // Then, select existing data from Supabase.
-  const { data, status, error } = await supabase
-    .rpc('select_chat_recent_messages', {
-      _address: address.toLowerCase(),
-      _offset: page * 10,
-    })
-    .returns<SupabaseChatMessageTx[]>();
-
-  // Force an update if there's an error, there's no data, or if the data was
-  // last updated more than 4 hours ago.
-  if (
-    (error && status !== 406) ||
-    (data && data.length === 0) ||
-    !data ||
-    !addressData ||
-    addressData.length === 0 ||
-    (addressData &&
-      addressData[0] &&
-      Date.now() - new Date(addressData[0].lastUpdated).getTime() > 14_400_000)
-  ) {
-    const response = await fetch('https://api.transpose.io/sql', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': process.env.TRANSPOSE_API_KEY,
+  const response = await fetch('https://api.evm.storage/canvas_api.v1.CanvasApiService/Query', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      canvas_id: '9bd2632b-a0f4-40db-84c1-985c866e997e',
+      api_endpoint: 'get_messages',
+      api_key: 'sim-api-e80d0a607c29a0d2',
+      query_parameters: {
+        chain_id: '1',
+        addr: address.toLowerCase(),
+        offset: (page * 10).toString(),
       },
-      body: JSON.stringify({
-        // Note: we select up to the most recent 250 messages whenever the data
-        // is stale or nonexistent.
-        // eslint-disable-next-line
-      sql: `SELECT t.block_number, t.from_address, t.to_address, t.value, raw.message, t.timestamp, t.transaction_hash FROM ( SELECT from_address, to_address, VALUE, INPUT, block_number, TIMESTAMP, transaction_hash, ROW_NUMBER() OVER ( PARTITION BY ( CASE WHEN from_address != \'{{address}}\' THEN from_address ELSE to_address END ) ORDER BY block_number DESC ) rn FROM ethereum.transactions WHERE INPUT IS NOT NULL AND ( from_address = \'{{address}}\' OR to_address = \'{{address}}\' ) ) AS t, LATERAL ( SELECT CONVERT_FROM( DECODE( SUBSTRING( REGEXP_REPLACE(t.input, \'00\', \'\', \'g\') FROM 3 ), \'hex\' ), \'LATIN1\' ) AS message ) AS raw WHERE t.rn = 1 AND LENGTH(raw.message) > 0 AND ( LENGTH(raw.message) - LENGTH(REGEXP_REPLACE(raw.message, '[\\u002D\\u0030-\\u0039\\u0041-\\u005A\\u005F\\u0061-\\u007A!@#$%^&*()_+<>]', '', 'g')) )::float / LENGTH(raw.message) >= 0.5 ORDER BY timestamp DESC LIMIT 250 OFFSET {{offset}}`,
-        parameters: { address, offset: page * 10 },
-      }),
-    });
+    }),
+  });
 
-    if (!response || !response.ok) return [];
+  const data = await response.json();
+  const rows = data.rows;
+  if (!rows) return [];
 
-    const json = await response.json();
-    if (!json || !json.results) return [];
+  // data.columns will be ['block_number', 'from_addr', 'to_addr', 'value', 'message', 'msg_time', 'txn_hash']
 
-    const messages = json.results.map((tx: TransposeOnChainMessagesResponse) => ({
-      blockNumber: tx.block_number,
-      from: tx.from_address.toLowerCase(),
-      to: tx.to_address.toLowerCase(),
-      value: tx.value,
-      message: tx.message,
-      timestamp: new Date(tx.timestamp),
-      txHash: tx.transaction_hash.toLowerCase(),
-    }));
-
-    // Upsert into Supabase.
-    await supabase.from('chat_last_updated').upsert({
-      address: address.toLowerCase(),
-      lastUpdated: new Date().toISOString(),
-    });
-    await supabase.from('chat_txs').upsert(messages);
-
-    return messages.slice(0, 20);
-  }
-
-  return data.map(({ timestamp, ...rest }) => ({ timestamp: new Date(timestamp), ...rest }));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return rows.map((row: any) => {
+    // row will be something like this:
+    // {
+    //   value: [
+    //     { bigDecimal: '46349' },
+    //     { string: '0x22f2dcff5ad78c3eb6850b5cb951127b659522e6' },
+    //     { string: '0x9aa9205faa68e731703c633b53fe5af8ece59d38' },
+    //     { bigDecimal: '1000000000000000000' },
+    //     { string: 'Franko is Freedom.' },
+    //     { string: '2015-08-07 04:27:57' },
+    //     {
+    //       string: '0x4a110de8110bb9eb250bdeb772ecafd517dfa109c14ff5d93dcfb96e9c562bb8'
+    //     }
+    //   ]
+    // }
+    const value = row.value;
+    return {
+      blockNumber: Number(value[0].bigDecimal),
+      from: value[1].string,
+      to: value[2].string,
+      value: Number(value[3].bigDecimal),
+      message: value[4].string,
+      timestamp: new Date(value[5].string),
+      txHash: value[6].string,
+    };
+  });
 };
 
 export default fetchRecentMessages;
